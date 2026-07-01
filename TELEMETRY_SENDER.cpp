@@ -29,9 +29,20 @@ namespace shizu {
 // ===========================================================================
 //  制御パラメータ (altitude_fusion_wifi.c より移植)
 // ===========================================================================
-static constexpr float ALPHA_H = 0.80f; // 高度相補フィルタ係数 (慣性側の重み)
-static constexpr float ALPHA_V = 0.75f; // 速度相補フィルタ係数
+// 相補フィルタ係数 (慣性=加速度積分側の重み)。1.0 に近いほど気圧を信用せず、
+// 加速度積分を優先する。気圧高度は室内気流/ドア開閉/プロペラ後流で数十cmの
+// ノイズが乗りやすく、その差分で作る v_baro は特に暴れるため、既定より慣性寄りへ
+// 振って「気圧(差分)の信用度」を落としている。ただし 1.0 にすると加速度バイアスの
+// ドリフトを気圧が抑えられず発散するので、緩く気圧で引き戻す余地は残す。
+static constexpr float ALPHA_H = 0.90f; // 高度: 気圧の反映を 20%→10% に低減
+static constexpr float ALPHA_V = 0.93f; // 速度: 気圧差分速度の反映を 25%→7% に低減
 static constexpr float A_Z_CLIP = 5.0f; // 世界鉛直加速度のクリップ [m/s^2]
+
+// 水平速度 (vx,vy) は GPS 等の位置基準が無く、加速度の積分だけでは
+// ドリフトが止まらない。そこでリーク積分で有界化する: 静止時は 0 へ緩く戻り、
+// 巡航時はやや低め (参考値) に出る。時定数を大きくするほどドリフトを許容して
+// 追従が良く、小さくするほど安定するがバイアスが増える。
+static constexpr float HVEL_LEAK_TAU = 3.0f; // 水平速度リーク時定数 [s]
 
 // 上昇/下降ヒステリシス閾値 [m/s]
 static constexpr float V_ENTER_ASC = +0.30f, V_LEAVE_ASC = +0.10f;
@@ -81,6 +92,16 @@ static void set_sensors_paused(bool paused) {
 static inline int32_t scaled(float x, float scale) {
   float v = x * scale;
   return (int32_t)(v >= 0 ? v + 0.5f : v - 0.5f);
+}
+
+// int16 に飽和させて詰める (加速度成分など ±32.767 を超えうる値の保護)。
+static inline int16_t scaled16(float x, float scale) {
+  int32_t v = scaled(x, scale);
+  if (v > 32767)
+    v = 32767;
+  if (v < -32768)
+    v = -32768;
+  return (int16_t)v;
 }
 
 // ===========================================================================
@@ -140,6 +161,21 @@ static float world_z_accel(const bno055_sample_t &b) {
   if (gn < 1.0f)
     return 0.0f;
   return (b.lax * b.gx + b.lay * b.gy + b.laz * b.gz) / gn;
+}
+
+// 機体系の線形加速度 (lax,lay,laz) を世界系の水平 北/東 成分へ回す。euler
+// (ψ=heading, θ=pitch, φ=roll) から作った body→NED DCM の上 2 行を使う。
+// 速度の大きさ算出が目的なので、絶対方位の厳密さより「非回転な一貫した水平系」で
+// 積分できることを優先している (ヨー回転を打ち消す ψ 回転が本質)。
+static void world_horiz_accel(const bno055_sample_t &b, float &a_n, float &a_e) {
+  const float d2r = 0.017453292519943f;
+  float ps = b.heading * d2r, th = b.pitch * d2r, ph = b.roll * d2r;
+  float sp = soft_math::sinf(ps), cp = soft_math::cosf(ps);
+  float st = soft_math::sinf(th), ct = soft_math::cosf(th);
+  float sr = soft_math::sinf(ph), cr = soft_math::cosf(ph);
+  float ax = b.lax, ay = b.lay, az = b.laz;
+  a_n = ax * (ct * cp) + ay * (sr * st * cp - cr * sp) + az * (cr * st * cp + sr * sp);
+  a_e = ax * (ct * sp) + ay * (sr * st * sp + cr * cp) + az * (cr * st * sp - sr * cp);
 }
 
 static VState next_state(VState cur, float v) {
@@ -388,8 +424,15 @@ struct __attribute__((packed)) batch_sample_t {
   uint32_t press_Pa;     // 気圧 [Pa]
   int32_t alt_baro_mm;   // 気圧高度 [mm]
   int32_t alt_fused_mm;  // 融合高度 [mm]
-  int32_t vel_mm_s;      // 上下速度 [mm/s]
-  int32_t az_mm_s2;      // 鉛直加速度 [mm/s^2]
+  int32_t vel_mm_s;      // 上下速度 (vz) [mm/s]
+  int32_t speed_mm_s;    // 対地速度 sqrt(vx^2+vy^2+vz^2) [mm/s]
+  int32_t az_mm_s2;      // 融合に使う世界鉛直加速度 [mm/s^2]
+  int16_t lax_mm_s2;     // 線形加速度 X (重力除去済) [mm/s^2]
+  int16_t lay_mm_s2;     // 線形加速度 Y [mm/s^2]
+  int16_t laz_mm_s2;     // 線形加速度 Z [mm/s^2]
+  int16_t gx_mm_s2;      // 重力ベクトル X [mm/s^2]
+  int16_t gy_mm_s2;      // 重力ベクトル Y [mm/s^2]
+  int16_t gz_mm_s2;      // 重力ベクトル Z [mm/s^2]
   uint16_t heading_cdeg; // 方位 [1/100 deg]
   int16_t roll_cdeg;     // ロール [1/100 deg]
   int16_t pitch_cdeg;    // ピッチ [1/100 deg]
@@ -398,12 +441,14 @@ struct __attribute__((packed)) batch_sample_t {
   uint8_t elev;          // エレベータ
   int16_t servo_cdeg;    // サーボ指令 [1/100 deg]
 };
-// クライアント (struct.unpack '<HhIiiiiHhhBBBh') と一致させる。
-static_assert(sizeof(batch_sample_t) == 35, "batch_sample_t must be 35 bytes");
+// クライアント (struct.unpack '<HhIiiiiihhhhhhHhhBBBh') と一致させる。
+static_assert(sizeof(batch_sample_t) == 51, "batch_sample_t must be 51 bytes");
 
 // 1 バッチに詰める最大サンプル数。スタッフィング後でも BLE 側の
 // TX_LINE_MAX(1024) に収まり、かつ概ね 1 notify(~512B) に乗るサイズに抑える。
-static constexpr int BATCH_MAX = 12;
+// サンプルが 51B に増えたため 9 に低減 (17+9*51+2=478B、最悪 2倍スタッフでも
+// 2*478+2=958 < 1024)。
+static constexpr int BATCH_MAX = 9;
 // バッチを送出する最大間隔。これを超えたら満杯でなくても flush する。
 static constexpr uint64_t BATCH_FLUSH_US = 50000; // 50ms
 
@@ -476,7 +521,8 @@ static void flush_batch() {
 // 計算済みサンプルをバッチへ 1 件積む。満杯なら先に flush する。
 static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
                        const bno055_sample_t &bno, float h_est, float v_est,
-                       float a_z, int vstate, int elev, float servo) {
+                       float speed, float a_z, int vstate, int elev,
+                       float servo) {
   if (batch_count == 0) {
     // バッチ先頭: 基準時刻を確定する。
     batch_seq0 = seq;
@@ -492,7 +538,14 @@ static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
   s.alt_baro_mm = scaled(bme.alt_m, 1000.f);
   s.alt_fused_mm = scaled(h_est, 1000.f);
   s.vel_mm_s = scaled(v_est, 1000.f);
+  s.speed_mm_s = scaled(speed, 1000.f);
   s.az_mm_s2 = scaled(a_z, 1000.f);
+  s.lax_mm_s2 = scaled16(bno.lax, 1000.f);
+  s.lay_mm_s2 = scaled16(bno.lay, 1000.f);
+  s.laz_mm_s2 = scaled16(bno.laz, 1000.f);
+  s.gx_mm_s2 = scaled16(bno.gx, 1000.f);
+  s.gy_mm_s2 = scaled16(bno.gy, 1000.f);
+  s.gz_mm_s2 = scaled16(bno.gz, 1000.f);
   s.heading_cdeg = (uint16_t)scaled(bno.heading, 100.f);
   s.roll_cdeg = (int16_t)scaled(bno.roll, 100.f);
   s.pitch_cdeg = (int16_t)scaled(bno.pitch, 100.f);
@@ -513,6 +566,7 @@ static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
 // ===========================================================================
 static float g_h_est = 0.f, g_v_est = 0.f, g_h_baro_prev = 0.f;
 static float g_last_a_z = 0.f;
+static float g_vx_est = 0.f, g_vy_est = 0.f; // 世界系 水平速度(北/東) [m/s] リーク積分
 static uint64_t g_last_bno_us = 0, g_last_baro_us = 0;
 static uint32_t g_last_bme_seq = 0;
 static bno055_sample_t g_bno = {}; // 直近の BNO サンプル(送信スナップ用)
@@ -538,6 +592,15 @@ static void handle_bno_push(uint32_t, uint32_t, uint32_t ptr, uint32_t) {
   g_h_est += g_v_est * dt + 0.5f * a_z * dt * dt;
   g_v_est += a_z * dt;
   g_last_a_z = a_z;
+
+  // 水平速度: 世界系の北/東加速度を積分し、位置基準が無いぶんリークで有界化する。
+  float a_n, a_e;
+  world_horiz_accel(g_bno, a_n, a_e);
+  float leak = 1.0f - dt / HVEL_LEAK_TAU;
+  if (leak < 0.0f)
+    leak = 0.0f;
+  g_vx_est = (g_vx_est + a_n * dt) * leak;
+  g_vy_est = (g_vy_est + a_e * dt) * leak;
 }
 
 // BME280 から新サンプルが push される。気圧高度で相補補正(BME の実レート ~21Hz)。
@@ -644,6 +707,8 @@ void TELEMETRY_SENDER::main() {
     // 融合状態は push ハンドラ(on_bno_sample / on_bme_sample)が随時更新済み。ここ
     // ではスナップショットして送信パケットを作るだけ(プルもポーリングもしない)。
     float h_est = g_h_est, v_est = g_v_est, a_z = g_last_a_z;
+    float vx = g_vx_est, vy = g_vy_est;
+    float speed = soft_math::sqrtf(vx * vx + vy * vy + v_est * v_est);
     vstate = next_state(vstate, v_est);
 
     // --- 高度保持 PID (監視用に算出。サーボ駆動は本オブジェクトの範囲外) ---
@@ -659,7 +724,7 @@ void TELEMETRY_SENDER::main() {
     if (telemetry_binary) {
       // バッチに積む。満杯なら batch_push 内で flush、そうでなくても一定間隔で
       // flush して低レート時の遅延を抑える。
-      batch_push(seq, up_ms, g_bme, g_bno, h_est, v_est, a_z, (int)vstate,
+      batch_push(seq, up_ms, g_bme, g_bno, h_est, v_est, speed, a_z, (int)vstate,
                  (int)elev, servo);
       // batch_push が満杯で flush 済み (batch_count==0) か、一定間隔超過なら
       // flush。
@@ -671,11 +736,16 @@ void TELEMETRY_SENDER::main() {
       flush_batch(); // 形式切替直後に溜まっていれば吐き出す
       int len = snprintf(
           line, sizeof(line),
-          "PICO,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%u,%d,%d,%ld\r\n",
+          "PICO,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,"
+          "%ld,%ld,%u,%d,%d,%ld\r\n",
           (unsigned long)seq, (unsigned long)up_ms,
           (long)scaled(g_bme.temp_c, 100.f), (long)scaled(g_bme.press_hpa, 100.f),
           (long)scaled(g_bme.alt_m, 1000.f), (long)scaled(h_est, 1000.f),
-          (long)scaled(v_est, 1000.f), (long)scaled(a_z, 1000.f),
+          (long)scaled(v_est, 1000.f), (long)scaled(speed, 1000.f),
+          (long)scaled(a_z, 1000.f),
+          (long)scaled(g_bno.lax, 1000.f), (long)scaled(g_bno.lay, 1000.f),
+          (long)scaled(g_bno.laz, 1000.f), (long)scaled(g_bno.gx, 1000.f),
+          (long)scaled(g_bno.gy, 1000.f), (long)scaled(g_bno.gz, 1000.f),
           (long)scaled(g_bno.heading, 100.f), (long)scaled(g_bno.roll, 100.f),
           (long)scaled(g_bno.pitch, 100.f), (unsigned)g_bno.calib, (int)vstate,
           (int)elev, (long)scaled(servo, 100.f));

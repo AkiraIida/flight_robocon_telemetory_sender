@@ -159,24 +159,40 @@ static bool read_raw9(int16_t r[9]) {
   return true;
 }
 
+// 破損値(0xFFFF)を chごとに据え置くための直近正常生値。
+static int16_t held_raw[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+
 // 重力/線形加速度/オイラー角/較正状態を 1 サンプル読む。失敗時 false。
 static bool read_motion(bno055_sample_t *s) {
-  // バースト破損検出: NDOF を ~100Hz でポーリングすると、フュージョン更新に読みが
+  // バースト破損: NDOF を ~100Hz でポーリングすると、フュージョン更新に読みが
   // 重なったとき heading(先頭2B)以外のバースト全体(roll/pitch/linaccel/gravity)が
-  // 丸ごと 0xFFFF に化ける現象がある(実測 ~19%、roll&pitch がきっかり -0.06°=0xFFFF、
-  // az もぴったり 0)。roll&pitch==0xFFFF を破損センチネルとして検出し、1 回読み直して
-  // 駄目ならサンプルごと捨てる(false)。偽の「水平」を制御へ流す方が危険なため、
-  // 据え置きではなく破棄して valid=false にする。
+  // 丸ごと 0xFFFF に化ける現象がある(実測 ~19%)。生値 9ch のうち 0xFFFF(=-1) の
+  // ch だけを直近の正常値で据え置き、正常な ch は活かす(サンプルは捨てない)。
+  // 破損があれば 1 回だけ読み直して新鮮な値の回収を試みる。g_reject_ffff が off の
+  // ときは検出せず素通し。
   int16_t r[9];
-  bool clean = false;
-  for (int attempt = 0; attempt < 2 && !clean; ++attempt) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
     if (!read_raw9(r))
       return false;
-    // roll&pitch==0xFFFF = 破損バースト。g_reject_ffff が off なら検出せず素通し。
-    clean = !g_reject_ffff || !(r[1] == -1 && r[2] == -1);
+    if (!g_reject_ffff)
+      break;
+    bool any_ffff = false;
+    for (int k = 0; k < 9; ++k)
+      if (r[k] == -1) {
+        any_ffff = true;
+        break;
+      }
+    if (!any_ffff)
+      break; // 全 ch 正常なら読み直し不要
   }
-  if (!clean)
-    return false; // 破損サンプルは公開しない
+  // 残った 0xFFFF ch のみ直近正常値で置換。正常 ch は held を更新する。
+  if (g_reject_ffff)
+    for (int k = 0; k < 9; ++k) {
+      if (r[k] == -1)
+        r[k] = held_raw[k];
+      else
+        held_raw[k] = r[k];
+    }
 
   s->heading = euler_deadband(r[0], held_eul[0]) / 16.0f;
   s->roll = euler_deadband(r[1], held_eul[1]) / 16.0f;

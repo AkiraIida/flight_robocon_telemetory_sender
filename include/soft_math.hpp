@@ -102,6 +102,37 @@ static inline float powf(float base, float exp_) {
   return expf(exp_ * logf(base));
 }
 
+// 床関数 (整数化キャストのみ。FPU 不使用)。
+static inline float floorf(float x) {
+  int i = (int)x;
+  float fi = (float)i;
+  return (x < fi) ? (fi - 1.0f) : fi;
+}
+
+// [-pi/2, pi/2] 上の sin テイラー近似 (x^7 まで、最大誤差 ~1.7e-4)。
+static inline float _sin_poly(float x) {
+  float x2 = x * x;
+  return x * (1.0f + x2 * (-1.0f / 6.0f +
+                          x2 * (1.0f / 120.0f + x2 * (-1.0f / 5040.0f))));
+}
+
+// 正弦。任意入力を [-pi, pi] に畳んでから [-pi/2, pi/2] に折り返して評価する。
+static inline float sinf(float x) {
+  const float PI = 3.14159265358979f;
+  const float TWO_PI = 6.28318530717959f;
+  const float HALF_PI = 1.57079632679490f;
+  const float INV_TWO_PI = 0.159154943091895f;
+  x = x - TWO_PI * floorf((x + PI) * INV_TWO_PI); // → [-pi, pi)
+  if (x > HALF_PI)
+    x = PI - x;
+  else if (x < -HALF_PI)
+    x = -PI - x;
+  return _sin_poly(x);
+}
+
+// 余弦。cos(x) = sin(x + pi/2)。
+static inline float cosf(float x) { return sinf(x + 1.57079632679490f); }
+
 } // namespace soft_math
 } // namespace shizu
 

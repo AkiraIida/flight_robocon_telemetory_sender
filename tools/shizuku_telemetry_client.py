@@ -411,13 +411,18 @@ class App:
             if len(rec) < BATCH_SAMPLE_SIZE:
                 break
             (d_ms, temp_cC, press_Pa, alt_baro_mm, alt_fused_mm, vel_mm_s,
-             az_mm_s2, head_cdeg, roll_cdeg, pitch_cdeg, calib, vstate, elev,
+             speed_mm_s, az_mm_s2, lax_mm, lay_mm, laz_mm, gx_mm, gy_mm, gz_mm,
+             head_cdeg, roll_cdeg, pitch_cdeg, calib, vstate, elev,
              servo_cdeg) = struct.unpack(BATCH_SAMPLE_FMT, rec)
             vals = {
                 "seq": seq0 + i, "up_ms": (t0_up_ms + d_ms) / 1000.0,
                 "temp_c": temp_cC / 100.0, "press_hpa": press_Pa / 100.0,
                 "alt_baro_m": alt_baro_mm / 1000.0, "alt_fused_m": alt_fused_mm / 1000.0,
-                "vel_m_s": vel_mm_s / 1000.0, "az_m_s2": az_mm_s2 / 1000.0,
+                "vel_m_s": vel_mm_s / 1000.0, "speed_m_s": speed_mm_s / 1000.0,
+                "az_m_s2": az_mm_s2 / 1000.0,
+                "lax_m_s2": lax_mm / 1000.0, "lay_m_s2": lay_mm / 1000.0,
+                "laz_m_s2": laz_mm / 1000.0, "gx_m_s2": gx_mm / 1000.0,
+                "gy_m_s2": gy_mm / 1000.0, "gz_m_s2": gz_mm / 1000.0,
                 "heading": head_cdeg / 100.0, "roll": roll_cdeg / 100.0,
                 "pitch": pitch_cdeg / 100.0, "calib": calib,
                 "vstate": vstate, "elev": elev, "servo_deg": servo_cdeg / 100.0,

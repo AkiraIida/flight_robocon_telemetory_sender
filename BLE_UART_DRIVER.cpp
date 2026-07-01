@@ -41,6 +41,17 @@ static uint16_t conn_interval = 0;
 // (fail-closed)。独自の秘密は持たず、SM の判定を読むだけ。
 static bool cmd_authorized = false;
 
+// ---- 接続ウォッチドッグ ----------------------------------------------------
+// Central(母艦)が消えても DISCONNECTION_COMPLETE を取りこぼすと con_handle が
+// 有効なまま残り、アドバタイズが再開されず新規接続を受けられない=母艦から再接続
+// できない。そこで「Central が生きている兆候(接続確立/認可/can-send-now/RX 書込)」
+// が一定時間途絶えたら gap_disconnect で強制切断し再アドバタイズへ戻す。健全な
+// 通信中は notify のたびに can-send-now が来るので誤発火しない。人手が絡むペアリング
+// 確認中の誤切断を避けるため、認可済み(cmd_authorized)のセッションだけを対象にする。
+static constexpr uint64_t CONN_IDLE_TIMEOUT_US = 5000000ull; // 5s
+static uint64_t last_conn_activity_us = 0;
+static inline void note_conn_activity() { last_conn_activity_us = time_us_64(); }
+
 // ---- 受信バイトの配送先 (sink) --------------------------------------------
 // set_rx_sink で設定。0xFFFF は無効。
 static uint32_t rx_sink_obj_id = 0xFFFF;
@@ -259,6 +270,7 @@ static int att_write_callback(hci_con_handle_t connection_handle,
   // RX characteristic の値への書き込み = Central からの受信データ
   if (att_handle ==
       ATT_CHARACTERISTIC_6E400002_B5A3_F393_E0A9_E50E24DCCA9E_01_VALUE_HANDLE) {
+    note_conn_activity(); // Central からの書込=生存の兆候
     process_rx(buffer, buffer_size);
     return 0;
   }
@@ -274,10 +286,12 @@ static void print_conn_interval(const char *tag) {
          (unsigned long)(x100 / 100), (unsigned long)(x100 % 100));
 }
 
-// CI=12 units (15.00ms) を強制要求する (min=max=12)。latency=0、
+// 接続インターバルを速める要求。min=FORCED_CI, max=2*FORCED_CI, latency=0,
 // supervision timeout=400 (4000ms; 制約 timeout > 2*(1+latency)*CI を満たす)。
-// 受理されれば CONNECTION_UPDATE_COMPLETE が届き、そこで新 CI を表示する。
-static constexpr uint16_t FORCED_CI = 6;
+// ★ Apple/macOS は「接続インターバル最小 15ms」を要求し、これを下回る値を要求すると
+//   接続を数秒で強制切断する。以前の 6(=7.5ms) が macOS 側の 2 秒切断の原因だった。
+//   12 units = 15.00ms が Apple 準拠の最速。iOS/macOS 相手はこれ以上速くできない。
+static constexpr uint16_t FORCED_CI = 12;
 
 // 接続中のリンク RSSI を周期的にサンプリングする間隔 (ms)。poll ループが
 // gap_read_rssi を投げ、結果は GAP_EVENT_RSSI_MEASUREMENT で返り、"RSSI=<dBm>"
@@ -289,7 +303,9 @@ static void request_fast_ci() {
     return;
   int r = gap_request_connection_parameter_update(con_handle, FORCED_CI,
                                                   2*FORCED_CI, 0, 400);
-  printf("[BLE_UART] request CI=%u (15.00 ms) -> %d\n", FORCED_CI, r);
+  uint32_t ms100 = (uint32_t)FORCED_CI * 125u; // 単位 1.25ms → ms×100
+  printf("[BLE_UART] request CI min=%lu.%02lu ms -> %d\n",
+         (unsigned long)(ms100 / 100), (unsigned long)(ms100 % 100), r);
 }
 
 // ---- HCI / ATT イベント ----------------------------------------------------
@@ -318,6 +334,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
       if (h == con_handle)
         break; // ← 二重配送ガード(下記参照)
       con_handle = h;
+      note_conn_activity(); // ウォッチドッグの基準時刻を接続時に更新
       // 接続時の Connection Interval を捕捉 (ペアリング完了時に表示する)。
       conn_interval =
           hci_subevent_le_connection_complete_get_conn_interval(packet);
@@ -351,6 +368,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
   }
   case ATT_EVENT_CAN_SEND_NOW:
     can_send_requested = false;
+    note_conn_activity(); // Central が notify を受けている=生存の兆候
     flush_tx();
     break;
 
@@ -413,6 +431,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
   case SM_EVENT_PAIRING_COMPLETE:
     if (sm_event_pairing_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
       cmd_authorized = true;
+      note_conn_activity(); // 認可直後からウォッチドッグの窓を仕切り直す
       printf("[BLE_UART] pairing complete -> authorized\n");
       print_conn_interval("paired"); // ★ ペアリング直後に CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
@@ -430,6 +449,7 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel,
     if (sm_event_reencryption_complete_get_status(packet) ==
         ERROR_CODE_SUCCESS) {
       cmd_authorized = true;
+      note_conn_activity(); // 再接続(再暗号化)直後もウォッチドッグの窓を仕切り直す
       printf("[BLE_UART] reencryption complete -> authorized\n");
       print_conn_interval("paired"); // ★ 再接続(再暗号化)直後にも CI を表示
       request_fast_ci();             // ★ CI=12 (15ms) を強制要求
@@ -557,6 +577,7 @@ void BLE_UART_DRIVER::init() {
 
   // 5) poll ループ
   absolute_time_t next_rssi = make_timeout_time_ms(RSSI_PERIOD_MS);
+  absolute_time_t next_adv_ensure = make_timeout_time_ms(1000);
   while (true) {
     cyw43_arch_poll();
 
@@ -588,6 +609,30 @@ void BLE_UART_DRIVER::init() {
         !tx_empty() && !can_send_requested) {
       can_send_requested = true;
       att_server_request_can_send_now_event(con_handle);
+    }
+
+    // 接続ウォッチドッグ: 認可済みセッションで Central の生存兆候が
+    // CONN_IDLE_TIMEOUT_US 途絶えたら強制切断する (消えた母艦/取りこぼした切断からの
+    // 復帰用)。DISCONNECTION_COMPLETE を取りこぼしてもハングしないよう、ローカル状態も
+    // その場で畳む。実際の再アドバタイズは下の「広告保険」が未接続を見て行う。
+    if (con_handle != HCI_CON_HANDLE_INVALID && cmd_authorized &&
+        time_us_64() - last_conn_activity_us > CONN_IDLE_TIMEOUT_US) {
+      printf("[BLE_UART] link idle > %lums, forcing disconnect\n",
+             (unsigned long)(CONN_IDLE_TIMEOUT_US / 1000));
+      gap_disconnect(con_handle);
+      con_handle = HCI_CON_HANDLE_INVALID;
+      tx_notify_enabled = false;
+      can_send_requested = false;
+      cmd_authorized = false;
+      nc_pending_handle = HCI_CON_HANDLE_INVALID;
+    }
+
+    // 広告保険: 未接続なのに広告が出ていない状況(切断イベント取りこぼし/enable 失敗)を
+    // 避けるため、切断中は 1s ごとに広告を張り直す。enable は冪等なので無害。これが
+    // 無いと一度切れたら二度と見つからず、母艦から再接続できない。
+    if (con_handle == HCI_CON_HANDLE_INVALID && time_reached(next_adv_ensure)) {
+      gap_advertisements_enable(1);
+      next_adv_ensure = make_timeout_time_ms(1000);
     }
     obj_api::yield_us(1000);
   }

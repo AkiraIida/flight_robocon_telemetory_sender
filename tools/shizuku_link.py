@@ -16,8 +16,10 @@
 import asyncio
 import queue
 import struct
+import sys
 import threading
 import time
+import traceback
 
 from bleak import BleakClient, BleakScanner
 
@@ -40,8 +42,9 @@ FRAME_MARKER_BATCH = 0x02
 FRAME_ESC = 0x1B
 BATCH_HDR_FMT = "<BBBIIIH"               # ver,count,flags,seq0,t0_up_ms,t0_wall_s,t0_wall_ms
 BATCH_HDR_SIZE = struct.calcsize(BATCH_HDR_FMT)        # 17
-BATCH_SAMPLE_FMT = "<HhIiiiiHhhBBBh"     # d_ms,temp,press,altb,altf,vel,az,head,roll,pitch,calib,vstate,elev,servo
-BATCH_SAMPLE_SIZE = struct.calcsize(BATCH_SAMPLE_FMT)  # 35
+# d_ms,temp,press,altb,altf,vel,speed,az,lax,lay,laz,gx,gy,gz,head,roll,pitch,calib,vstate,elev,servo
+BATCH_SAMPLE_FMT = "<HhIiiiiihhhhhhHhhBBBh"
+BATCH_SAMPLE_SIZE = struct.calcsize(BATCH_SAMPLE_FMT)  # 51
 
 # ---- テレメトリ列の定義 (firmware の並びと一致) ---------------------------
 #   (キー, 表示名, スケール除数, 単位)。整数値を除数で割ると物理量になる。
@@ -53,7 +56,14 @@ TELEMETRY_FIELDS = [
     ("alt_baro_m", "気圧高度",        1000, "m"),
     ("alt_fused_m", "融合高度",       1000, "m"),
     ("vel_m_s",    "上下速度",        1000, "m/s"),
+    ("speed_m_s",  "対地速度",        1000, "m/s"),
     ("az_m_s2",    "鉛直加速度",      1000, "m/s²"),
+    ("lax_m_s2",   "線形加速度X",     1000, "m/s²"),
+    ("lay_m_s2",   "線形加速度Y",     1000, "m/s²"),
+    ("laz_m_s2",   "線形加速度Z",     1000, "m/s²"),
+    ("gx_m_s2",    "重力X",           1000, "m/s²"),
+    ("gy_m_s2",    "重力Y",           1000, "m/s²"),
+    ("gz_m_s2",    "重力Z",           1000, "m/s²"),
     ("heading",    "方位",            100,  "°"),
     ("roll",       "ロール",          100,  "°"),
     ("pitch",      "ピッチ",          100,  "°"),
@@ -93,13 +103,18 @@ def frame_unstuff(data: bytes) -> bytes:
 
 
 def _vals_from_sample(seq, up_s, rec_fields):
-    (d_ms, temp_cC, press_Pa, alt_baro_mm, alt_fused_mm, vel_mm_s, az_mm_s2,
+    (d_ms, temp_cC, press_Pa, alt_baro_mm, alt_fused_mm, vel_mm_s, speed_mm_s,
+     az_mm_s2, lax_mm, lay_mm, laz_mm, gx_mm, gy_mm, gz_mm,
      head_cdeg, roll_cdeg, pitch_cdeg, calib, vstate, elev, servo_cdeg) = rec_fields
     return {
         "seq": seq, "up_ms": up_s,
         "temp_c": temp_cC / 100.0, "press_hpa": press_Pa / 100.0,
         "alt_baro_m": alt_baro_mm / 1000.0, "alt_fused_m": alt_fused_mm / 1000.0,
-        "vel_m_s": vel_mm_s / 1000.0, "az_m_s2": az_mm_s2 / 1000.0,
+        "vel_m_s": vel_mm_s / 1000.0, "speed_m_s": speed_mm_s / 1000.0,
+        "az_m_s2": az_mm_s2 / 1000.0,
+        "lax_m_s2": lax_mm / 1000.0, "lay_m_s2": lay_mm / 1000.0,
+        "laz_m_s2": laz_mm / 1000.0, "gx_m_s2": gx_mm / 1000.0,
+        "gy_m_s2": gy_mm / 1000.0, "gz_m_s2": gz_mm / 1000.0,
         "heading": head_cdeg / 100.0, "roll": roll_cdeg / 100.0,
         "pitch": pitch_cdeg / 100.0, "calib": calib,
         "vstate": vstate, "elev": elev, "servo_deg": servo_cdeg / 100.0,
@@ -248,20 +263,46 @@ class BleWorker:
         self.post("scan_done", items=[(lbl, addr) for _, lbl, addr in items])
 
     async def connect(self, address: str):
-        if self.client and self.client.is_connected:
-            await self.client.disconnect()
+        # 直前の接続が残っていれば確実に落とし、CoreBluetooth の解放を少し待つ。
+        # これをしないと macOS では再接続直後にリンクが不安定になり即ドロップしやすい。
+        if self.client:
+            try:
+                if self.client.is_connected:
+                    await self.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.4)
         self.log(f"接続中… {address}")
 
         def _on_disconnect(_c):
             self.post("disconnected")
             self.log("切断されました")
 
-        try:
-            self.client = BleakClient(address, disconnected_callback=_on_disconnect)
-            await self.client.connect()
-        except Exception as e:  # noqa: BLE001
-            self.log(f"接続失敗: {e}")
-            self.post("disconnected")
+        # macOS(CoreBluetooth)では address 文字列/古い BLEDevice だと切断後の再接続で
+        # ペリフェラルを見失いやすい。失敗したら再スキャンして取り直し、数回リトライする。
+        target = self.devices.get(address, address)
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                self.client = BleakClient(
+                    target, disconnected_callback=_on_disconnect, timeout=15.0)
+                await self.client.connect()
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                self.log(f"接続試行 {attempt}/3 失敗: {e}")
+                try:  # 再スキャンでペリフェラルを取り直す
+                    found = await BleakScanner.discover(timeout=3.0)
+                    for d in found:
+                        self.devices[d.address] = d
+                    target = self.devices.get(address, address)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(0.3)
+        if last_err is not None:
+            self.log(f"接続失敗: {last_err}")
+            self.post("disconnected", error=str(last_err))
             return
 
         def _on_rx(_sender, data: bytearray):
@@ -272,8 +313,11 @@ class BleWorker:
             await self.client.start_notify(NUS_TX_UUID, _on_rx)
         except Exception as e:  # noqa: BLE001
             self.log(f"notify 購読失敗: {e}")
-            await self.client.disconnect()
-            self.post("disconnected")
+            try:
+                await self.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self.post("disconnected", error=f"notify: {e}")
             return
         self.log("接続完了・notify 購読開始")
         self.post("connected", address=address)
@@ -310,8 +354,14 @@ class BleWorker:
             self.post("rssi_host", value=None, error=str(e))
 
     async def disconnect(self):
-        if self.client and self.client.is_connected:
-            await self.client.disconnect()
+        try:
+            if self.client and self.client.is_connected:
+                await self.client.disconnect()
+        finally:
+            # 明示的 disconnect では disconnected_callback が発火しない bleak/
+            # バックエンドがあるため、ここでも必ず通知して UI(接続ボタン/接続フラグ)を
+            # 戻す。これが無いと connected のまま固まり再接続できなくなる。
+            self.post("disconnected")
 
 
 __all__ = [
