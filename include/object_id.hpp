@@ -20,6 +20,7 @@ enum struct object_ids : uint32_t {
   BME280_DRIVER=13,     // 気圧/温度センサ (I2C 0x76)。高度を算出して公開する。
   BNO055_DRIVER=14,     // 9 軸 IMU (I2C 0x28)。重力/線形加速度/姿勢を公開する。
   TELEMETRY_SENDER=15,  // 上記 2 ドライバを購読し融合 → BLE UART で母艦へ送信する。
+  FLIGHT_CONTROLLER=16, // TELEMETRY から状態を受け、ピッチ/ヨー/スロットルの制御則を回す。
 };
 
 #endif // SHIZU_OBJECT_ID_HPP

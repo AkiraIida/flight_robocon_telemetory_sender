@@ -42,9 +42,10 @@ FRAME_MARKER_BATCH = 0x02
 FRAME_ESC = 0x1B
 BATCH_HDR_FMT = "<BBBIIIH"               # ver,count,flags,seq0,t0_up_ms,t0_wall_s,t0_wall_ms
 BATCH_HDR_SIZE = struct.calcsize(BATCH_HDR_FMT)        # 17
-# d_ms,temp,press,altb,altf,vel,speed,az,lax,lay,laz,gx,gy,gz,head,roll,pitch,calib,vstate,elev,servo
-BATCH_SAMPLE_FMT = "<HhIiiiiihhhhhhHhhBBBh"
-BATCH_SAMPLE_SIZE = struct.calcsize(BATCH_SAMPLE_FMT)  # 51
+# d_ms,temp,press,altb,altf,vel,speed,az,lax,lay,laz,gx,gy,gz,head,roll,pitch,
+# calib,vstate,elev,servo(elevator),rudder,thr_pct
+BATCH_SAMPLE_FMT = "<HhIiiiiihhhhhhHhhBBBhhB"
+BATCH_SAMPLE_SIZE = struct.calcsize(BATCH_SAMPLE_FMT)  # 54
 
 # ---- テレメトリ列の定義 (firmware の並びと一致) ---------------------------
 #   (キー, 表示名, スケール除数, 単位)。整数値を除数で割ると物理量になる。
@@ -69,8 +70,10 @@ TELEMETRY_FIELDS = [
     ("pitch",      "ピッチ",          100,  "°"),
     ("calib",      "較正(SGAM)",      1,    ""),
     ("vstate",     "上下状態",        1,    ""),
-    ("elev",       "エレベータ",      1,    ""),
-    ("servo_deg",  "サーボ指令",      100,  "°"),
+    ("elev",       "エレベータ方向",  1,    ""),
+    ("servo_deg",  "エレベータ指令",  100,  "°"),
+    ("rudder_deg", "ラダー指令",      100,  "°"),
+    ("throttle",   "スロットル",      100,  ""),   # 0..100 -> 0..1
 ]
 VSTATE_STR = {0: "LEVEL -", 1: "ASC ▲", 2: "DESC ▼"}
 ELEV_STR = {0: "NEUTRAL", 1: "UP ▲", 2: "DOWN ▼"}
@@ -105,7 +108,8 @@ def frame_unstuff(data: bytes) -> bytes:
 def _vals_from_sample(seq, up_s, rec_fields):
     (d_ms, temp_cC, press_Pa, alt_baro_mm, alt_fused_mm, vel_mm_s, speed_mm_s,
      az_mm_s2, lax_mm, lay_mm, laz_mm, gx_mm, gy_mm, gz_mm,
-     head_cdeg, roll_cdeg, pitch_cdeg, calib, vstate, elev, servo_cdeg) = rec_fields
+     head_cdeg, roll_cdeg, pitch_cdeg, calib, vstate, elev, servo_cdeg,
+     rudder_cdeg, thr_pct) = rec_fields
     return {
         "seq": seq, "up_ms": up_s,
         "temp_c": temp_cC / 100.0, "press_hpa": press_Pa / 100.0,
@@ -118,6 +122,7 @@ def _vals_from_sample(seq, up_s, rec_fields):
         "heading": head_cdeg / 100.0, "roll": roll_cdeg / 100.0,
         "pitch": pitch_cdeg / 100.0, "calib": calib,
         "vstate": vstate, "elev": elev, "servo_deg": servo_cdeg / 100.0,
+        "rudder_deg": rudder_cdeg / 100.0, "throttle": thr_pct / 100.0,
     }
 
 

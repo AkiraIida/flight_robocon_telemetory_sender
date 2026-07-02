@@ -413,7 +413,7 @@ class App:
             (d_ms, temp_cC, press_Pa, alt_baro_mm, alt_fused_mm, vel_mm_s,
              speed_mm_s, az_mm_s2, lax_mm, lay_mm, laz_mm, gx_mm, gy_mm, gz_mm,
              head_cdeg, roll_cdeg, pitch_cdeg, calib, vstate, elev,
-             servo_cdeg) = struct.unpack(BATCH_SAMPLE_FMT, rec)
+             servo_cdeg, rudder_cdeg, thr_pct) = struct.unpack(BATCH_SAMPLE_FMT, rec)
             vals = {
                 "seq": seq0 + i, "up_ms": (t0_up_ms + d_ms) / 1000.0,
                 "temp_c": temp_cC / 100.0, "press_hpa": press_Pa / 100.0,
@@ -426,6 +426,7 @@ class App:
                 "heading": head_cdeg / 100.0, "roll": roll_cdeg / 100.0,
                 "pitch": pitch_cdeg / 100.0, "calib": calib,
                 "vstate": vstate, "elev": elev, "servo_deg": servo_cdeg / 100.0,
+                "rudder_deg": rudder_cdeg / 100.0, "throttle": thr_pct / 100.0,
             }
             # パネルは最後のサンプルだけ更新 (グラフ/統計は全サンプル)。
             self._update_telemetry(vals, update_panel=(i == count - 1))

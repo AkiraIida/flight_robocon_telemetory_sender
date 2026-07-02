@@ -19,6 +19,7 @@
 #include <object_headers/BLE_UART_DRIVER.hpp>
 #include <object_headers/BME280_DRIVER.hpp>
 #include <object_headers/BNO055_DRIVER.hpp>
+#include <object_headers/FLIGHT_CONTROLLER.hpp>
 #include <object_headers/TELEMETRY_SENDER.hpp>
 #include <object_id.hpp>
 #include <pico/time.h>
@@ -44,14 +45,8 @@ static constexpr float A_Z_CLIP = 5.0f; // 世界鉛直加速度のクリップ 
 // 追従が良く、小さくするほど安定するがバイアスが増える。
 static constexpr float HVEL_LEAK_TAU = 3.0f; // 水平速度リーク時定数 [s]
 
-// 上昇/下降ヒステリシス閾値 [m/s]
-static constexpr float V_ENTER_ASC = +0.30f, V_LEAVE_ASC = +0.10f;
-static constexpr float V_ENTER_DESC = -0.30f, V_LEAVE_DESC = -0.10f;
-
-// 高度保持 PID
-static constexpr float H_TARGET_M = 1.00f, H_DEADBAND_M = 0.10f;
-static constexpr float KP_ALT = 30.0f, KI_ALT = 1.0f, KD_ALT = 5.0f;
-static constexpr float SERVO_LIMIT_DEG = 30.0f, I_TERM_LIMIT = 15.0f;
+// テレメトリの elev 方向ヒントを FLIGHT_CONTROLLER のエレベータ指令から導く閾値 [deg]。
+// (飛行制御の本体は FLIGHT_CONTROLLER に分離済み。ここは融合+通信のみ担う。)
 static constexpr float ELEV_UP_DEG = +5.0f, ELEV_DOWN_DEG = -5.0f;
 
 // サンプル周期 (R コマンドで変更可)。既定 20ms = 50Hz。バッチ送信なので、この
@@ -64,7 +59,6 @@ static volatile uint32_t telemetry_period_us = 10000;
 // の実効上限 ~140kbps に対し 余裕を持って高レート送信できる。
 static volatile bool telemetry_binary = true;
 
-enum VState { ST_LEVEL = 0, ST_ASC = 1, ST_DESC = 2 };
 enum Elev { EL_NEUTRAL = 0, EL_UP = 1, EL_DOWN = 2 };
 
 // ===========================================================================
@@ -129,32 +123,6 @@ static uint8_t calib_dl_data[BNO055_CALIB_PROFILE_LEN];
 static char rxline[80];
 static uint32_t rxlen = 0;
 
-// ===========================================================================
-//  PID
-// ===========================================================================
-struct PID {
-  float integral = 0.f, prev_err = 0.f;
-  bool first = true;
-  float step(float err, float dt) {
-    float p = KP_ALT * err;
-    integral += err * dt;
-    if (integral > I_TERM_LIMIT)
-      integral = I_TERM_LIMIT;
-    if (integral < -I_TERM_LIMIT)
-      integral = -I_TERM_LIMIT;
-    float i = KI_ALT * integral;
-    float d = first ? 0.f : KD_ALT * (err - prev_err) / dt;
-    prev_err = err;
-    first = false;
-    float out = p + i + d;
-    if (out > SERVO_LIMIT_DEG)
-      out = SERVO_LIMIT_DEG;
-    if (out < -SERVO_LIMIT_DEG)
-      out = -SERVO_LIMIT_DEG;
-    return out;
-  }
-};
-
 // 傾き補正済みの世界鉛直加速度 (重力ベクトルへの線形加速度の射影)。
 static float world_z_accel(const bno055_sample_t &b) {
   float gn = soft_math::sqrtf(b.gx * b.gx + b.gy * b.gy + b.gz * b.gz);
@@ -178,20 +146,14 @@ static void world_horiz_accel(const bno055_sample_t &b, float &a_n, float &a_e) 
   a_e = ax * (ct * sp) + ay * (sr * st * sp + cr * cp) + az * (cr * st * sp - sr * cp);
 }
 
-static VState next_state(VState cur, float v) {
-  switch (cur) {
-  case ST_LEVEL:
-    if (v > V_ENTER_ASC)
-      return ST_ASC;
-    if (v < V_ENTER_DESC)
-      return ST_DESC;
-    return ST_LEVEL;
-  case ST_ASC:
-    return (v < V_LEAVE_ASC) ? ST_LEVEL : ST_ASC;
-  case ST_DESC:
-    return (v > V_LEAVE_DESC) ? ST_LEVEL : ST_DESC;
-  }
-  return ST_LEVEL;
+// FLIGHT_CONTROLLER へコマンドを 1 個転送する (arm/目標設定)。
+static void fc_cmd(uint8_t kind, float value) {
+  flight_cmd_t c;
+  c.kind = kind;
+  c.value = value;
+  call_method(object_ids::FLIGHT_CONTROLLER,
+              FLIGHT_CONTROLLER::METHOD_IDs::set_command,
+              (uint32_t)(uintptr_t)&c);
 }
 
 // ===========================================================================
@@ -329,6 +291,43 @@ static void handle_line() {
     }
     break;
   }
+  case 'A': { // 制御 arm/disarm: "A1"=arm, "A0"=disarm
+    bool arm = !(rxlen >= 2 && rxline[1] == '0');
+    fc_cmd(arm ? 1u : 0u, 0.f);
+    printf("[TELEMETRY] flight %s\n", arm ? "arm" : "disarm");
+    break;
+  }
+  case 'G': { // 制御目標: "G<sub><signed int>"
+    // sub= h:高度[cm] p:ピッチ[cdeg] y:方位[cdeg] t:スロットルトリム[permil]
+    if (rxlen >= 3) {
+      char sub = rxline[1];
+      int sign = 1;
+      uint32_t i = 2;
+      if (rxline[i] == '-') {
+        sign = -1;
+        ++i;
+      }
+      long v = 0;
+      bool any = false;
+      for (; i < rxlen; ++i) {
+        if (rxline[i] < '0' || rxline[i] > '9')
+          break;
+        v = v * 10 + (rxline[i] - '0');
+        any = true;
+      }
+      if (any) {
+        float fv = (float)(sign * v);
+        switch (sub) {
+        case 'h': fc_cmd(2, fv / 100.f); break;    // cm -> m
+        case 'p': fc_cmd(3, fv / 100.f); break;    // cdeg -> deg
+        case 'y': fc_cmd(4, fv / 100.f); break;    // cdeg -> deg
+        case 't': fc_cmd(5, fv / 1000.f); break;   // permil -> [0..1]
+        default: break;
+        }
+      }
+    }
+    break;
+  }
   default:
     break;
   }
@@ -437,12 +436,14 @@ struct __attribute__((packed)) batch_sample_t {
   int16_t roll_cdeg;     // ロール [1/100 deg]
   int16_t pitch_cdeg;    // ピッチ [1/100 deg]
   uint8_t calib;         // 較正 (SYS<<6|GYR<<4|ACC<<2|MAG)
-  uint8_t vstate;        // 上下状態
-  uint8_t elev;          // エレベータ
-  int16_t servo_cdeg;    // サーボ指令 [1/100 deg]
+  uint8_t vstate;        // 上下状態 (FLIGHT_CONTROLLER 由来)
+  uint8_t elev;          // エレベータ方向ヒント (0 中立/1 上げ/2 下げ)
+  int16_t servo_cdeg;    // エレベータ指令 [1/100 deg] (FLIGHT_CONTROLLER 由来)
+  int16_t rudder_cdeg;   // ラダー指令 [1/100 deg]
+  uint8_t thr_pct;       // スロットル指令 [0..100] (= throttle*100)
 };
-// クライアント (struct.unpack '<HhIiiiiihhhhhhHhhBBBh') と一致させる。
-static_assert(sizeof(batch_sample_t) == 51, "batch_sample_t must be 51 bytes");
+// クライアント (struct.unpack '<HhIiiiiihhhhhhHhhBBBhhB') と一致させる。
+static_assert(sizeof(batch_sample_t) == 54, "batch_sample_t must be 54 bytes");
 
 // 1 バッチに詰める最大サンプル数。スタッフィング後でも BLE 側の
 // TX_LINE_MAX(1024) に収まり、かつ概ね 1 notify(~512B) に乗るサイズに抑える。
@@ -521,8 +522,7 @@ static void flush_batch() {
 // 計算済みサンプルをバッチへ 1 件積む。満杯なら先に flush する。
 static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
                        const bno055_sample_t &bno, float h_est, float v_est,
-                       float speed, float a_z, int vstate, int elev,
-                       float servo) {
+                       float speed, float a_z, const control_out_t &ctrl) {
   if (batch_count == 0) {
     // バッチ先頭: 基準時刻を確定する。
     batch_seq0 = seq;
@@ -550,9 +550,14 @@ static void batch_push(uint32_t seq, uint32_t up_ms, const bme280_sample_t &bme,
   s.roll_cdeg = (int16_t)scaled(bno.roll, 100.f);
   s.pitch_cdeg = (int16_t)scaled(bno.pitch, 100.f);
   s.calib = bno.calib;
-  s.vstate = (uint8_t)vstate;
-  s.elev = (uint8_t)elev;
-  s.servo_cdeg = (int16_t)scaled(servo, 100.f);
+  s.vstate = ctrl.vstate;
+  s.elev = (uint8_t)((ctrl.elevator > ELEV_UP_DEG)     ? EL_UP
+                     : (ctrl.elevator < ELEV_DOWN_DEG) ? EL_DOWN
+                                                       : EL_NEUTRAL);
+  s.servo_cdeg = (int16_t)scaled(ctrl.elevator, 100.f);
+  s.rudder_cdeg = (int16_t)scaled(ctrl.rudder, 100.f);
+  float thr = ctrl.throttle < 0.f ? 0.f : (ctrl.throttle > 1.f ? 1.f : ctrl.throttle);
+  s.thr_pct = (uint8_t)scaled(thr, 100.f);
   batch_count++;
   if (batch_count >= BATCH_MAX)
     flush_batch();
@@ -662,10 +667,6 @@ void TELEMETRY_SENDER::main() {
   call_method(object_ids::BME280_DRIVER, BME280_DRIVER::METHOD_IDs::set_sample_sink,
               pack(TELEMETRY_SENDER::METHOD_IDs::on_bme_sample));
 
-  // 出力側の状態 (送信ループ内でのみ使用。融合状態は g_* で push ハンドラが更新)。
-  VState vstate = ST_LEVEL;
-  PID pid;
-
   uint32_t seq = 0;
   uint64_t prev_us = time_us_64();
   uint64_t last_flush_us = prev_us;
@@ -702,30 +703,42 @@ void TELEMETRY_SENDER::main() {
     float dt = (float)(now_us - prev_us) / 1e6f;
     prev_us = now_us;
     if (dt <= 0.f || dt > 0.5f)
-      dt = 0.04f; // PID 用 dt (送信周期相当)。異常値ガード。
+      dt = 0.04f; // 制御/送信周期相当の dt。異常値ガード。
 
     // 融合状態は push ハンドラ(on_bno_sample / on_bme_sample)が随時更新済み。ここ
-    // ではスナップショットして送信パケットを作るだけ(プルもポーリングもしない)。
+    // ではスナップショットするだけ(プルもポーリングもしない)。
     float h_est = g_h_est, v_est = g_v_est, a_z = g_last_a_z;
     float vx = g_vx_est, vy = g_vy_est;
     float speed = soft_math::sqrtf(vx * vx + vy * vy + v_est * v_est);
-    vstate = next_state(vstate, v_est);
 
-    // --- 高度保持 PID (監視用に算出。サーボ駆動は本オブジェクトの範囲外) ---
-    float h_err = H_TARGET_M - h_est;
-    float h_err_f = (soft_math::fabsf(h_err) < H_DEADBAND_M) ? 0.f : h_err;
-    float servo = pid.step(h_err_f, dt);
-    Elev elev = (servo > ELEV_UP_DEG)     ? EL_UP
-                : (servo < ELEV_DOWN_DEG) ? EL_DOWN
-                                          : EL_NEUTRAL;
+    // --- 飛行制御は FLIGHT_CONTROLLER に分離。融合状態を push し、最新指令を読む。
+    // call_method は yield せず同期実行されるので、スタック上の fst/ctrl は有効。---
+    flight_state_t fst;
+    fst.dt = dt;
+    fst.pitch = g_bno.pitch;
+    fst.roll = g_bno.roll;
+    fst.heading = g_bno.heading;
+    fst.alt = h_est;
+    fst.vel = v_est;
+    fst.valid = g_bno.valid;
+    call_method(object_ids::FLIGHT_CONTROLLER,
+                FLIGHT_CONTROLLER::METHOD_IDs::on_state,
+                (uint32_t)(uintptr_t)&fst);
+    control_out_t ctrl = {};
+    call_method(object_ids::FLIGHT_CONTROLLER,
+                FLIGHT_CONTROLLER::METHOD_IDs::read_control,
+                (uint32_t)(uintptr_t)&ctrl);
+    int elevdir = (ctrl.elevator > ELEV_UP_DEG)     ? EL_UP
+                  : (ctrl.elevator < ELEV_DOWN_DEG) ? EL_DOWN
+                                                    : EL_NEUTRAL;
+    float thr = ctrl.throttle < 0.f ? 0.f : (ctrl.throttle > 1.f ? 1.f : ctrl.throttle);
 
     // --- サンプルを送信 (既定: バイナリ・バッチ、F0: CSV 即時) ---
     uint32_t up_ms = (uint32_t)(now_us / 1000ull);
     if (telemetry_binary) {
       // バッチに積む。満杯なら batch_push 内で flush、そうでなくても一定間隔で
       // flush して低レート時の遅延を抑える。
-      batch_push(seq, up_ms, g_bme, g_bno, h_est, v_est, speed, a_z, (int)vstate,
-                 (int)elev, servo);
+      batch_push(seq, up_ms, g_bme, g_bno, h_est, v_est, speed, a_z, ctrl);
       // batch_push が満杯で flush 済み (batch_count==0) か、一定間隔超過なら
       // flush。
       if (batch_count == 0 || now_us - last_flush_us >= BATCH_FLUSH_US) {
@@ -737,7 +750,7 @@ void TELEMETRY_SENDER::main() {
       int len = snprintf(
           line, sizeof(line),
           "PICO,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,"
-          "%ld,%ld,%u,%d,%d,%ld\r\n",
+          "%ld,%ld,%u,%d,%d,%ld,%ld,%d\r\n",
           (unsigned long)seq, (unsigned long)up_ms,
           (long)scaled(g_bme.temp_c, 100.f), (long)scaled(g_bme.press_hpa, 100.f),
           (long)scaled(g_bme.alt_m, 1000.f), (long)scaled(h_est, 1000.f),
@@ -747,8 +760,9 @@ void TELEMETRY_SENDER::main() {
           (long)scaled(g_bno.laz, 1000.f), (long)scaled(g_bno.gx, 1000.f),
           (long)scaled(g_bno.gy, 1000.f), (long)scaled(g_bno.gz, 1000.f),
           (long)scaled(g_bno.heading, 100.f), (long)scaled(g_bno.roll, 100.f),
-          (long)scaled(g_bno.pitch, 100.f), (unsigned)g_bno.calib, (int)vstate,
-          (int)elev, (long)scaled(servo, 100.f));
+          (long)scaled(g_bno.pitch, 100.f), (unsigned)g_bno.calib,
+          (int)ctrl.vstate, (int)elevdir, (long)scaled(ctrl.elevator, 100.f),
+          (long)scaled(ctrl.rudder, 100.f), (int)scaled(thr, 100.f));
       if (len < 0)
         len = 0;
       if (len > (int)sizeof(line))

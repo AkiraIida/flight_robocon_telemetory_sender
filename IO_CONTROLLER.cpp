@@ -6,6 +6,7 @@
 #include <object_headers/BME280_DRIVER.hpp>
 #include <object_headers/BNO055_DRIVER.hpp>
 #include <object_headers/CYW43_BL_DRIVER.hpp>
+#include <object_headers/FLIGHT_CONTROLLER.hpp>
 #include <object_headers/HELLO_WORLD.hpp>
 #include <object_headers/IO_CONTROLLER.hpp>
 #include <object_headers/LINE_SENSOR_DRIVER.hpp>
@@ -38,6 +39,9 @@ void shizu::IO_CONTROLLER::main() {
                          (uintptr_t)BME280_DRIVER::init);
   obj_api::create_object((uint32_t)object_ids::BNO055_DRIVER, 14,
                          (uintptr_t)BNO055_DRIVER::init);
+  // 飛行制御は TELEMETRY より先に立て、on_state push を受けられるようにする。
+  obj_api::create_object((uint32_t)object_ids::FLIGHT_CONTROLLER, 16,
+                         (uintptr_t)FLIGHT_CONTROLLER::main);
   obj_api::create_object((uint32_t)object_ids::TELEMETRY_SENDER, 15,
                          (uintptr_t)TELEMETRY_SENDER::main);
 
